@@ -1,21 +1,23 @@
 """
 build_market_index.py
 Construct the master market index combining:
-  - FFIC leaked markets (ground truth)
+  - FFIC leaked markets (ground truth) — matched via market_id_prefix
   - Matched control markets (same category, similar resolution date, no leaks)
 
 Output: data/processed/market_index.parquet
 
 Schema:
-  condition_id       str    — Polymarket condition_id
+  market_id_prefix   str    — 8-char hex prefix (e.g. 0xc1b6d712)
+  condition_id       str    — full condition ID (if resolved, else same as prefix)
   is_leaked          int    — 1 = FFIC case, 0 = control
-  case_id            str    — FFIC case ID (NaN for controls)
+  case_id            str    — FFIC case ID (empty for controls)
   case_title         str    — human-readable title
   category           str    — market category
   news_timestamp     int    — Unix seconds — news release / resolution time
   window_start_24h   int    — news_timestamp - 86400
   window_start_48h   int    — news_timestamp - 172800
-  resolution_outcome str    — YES / NO / INVALID (NaN for controls)
+  resolution_outcome str    — YES / NO / INVALID (empty for controls)
+  trade_available    bool   — True if FFIC says trade history is available
 """
 
 import json
@@ -23,7 +25,6 @@ import pathlib
 import sys
 from datetime import datetime, timezone
 
-import duckdb
 import pandas as pd
 
 RAW_DIR = pathlib.Path(__file__).resolve().parents[2] / "data" / "raw"
@@ -35,10 +36,10 @@ CONTROL_MULTIPLIER = 3   # aim for 3× as many control markets as leaked
 
 
 def parse_timestamp(ts_str: str) -> int:
-    """Parse ISO 8601 timestamp string to Unix seconds."""
+    """Parse ISO 8601 date/datetime string to Unix seconds."""
     if not ts_str:
         return 0
-    ts_str = ts_str.rstrip("Z")
+    ts_str = str(ts_str).strip().rstrip("Z")
     for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
         try:
             dt = datetime.strptime(ts_str, fmt).replace(tzinfo=timezone.utc)
@@ -49,10 +50,19 @@ def parse_timestamp(ts_str: str) -> int:
 
 
 def load_ffic_rows(ffic_dir: pathlib.Path) -> list[dict]:
-    """Parse FFIC jsonl into flat per-market rows."""
+    """
+    Parse FFIC jsonl and CSV into flat per-market rows.
+    FFIC uses market_id_prefix (8-char hex) as the market identifier.
+    """
     jsonl = ffic_dir / "ffic-v1.jsonl"
     if not jsonl.exists():
         raise FileNotFoundError(f"FFIC jsonl not found at {jsonl}. Run fetch_ffic.py first.")
+
+    # Load resolved full condition IDs if available
+    resolved_path = ffic_dir / "resolved_ids.json"
+    resolved: dict[str, str] = {}
+    if resolved_path.exists():
+        resolved = {k.lower(): v.lower() for k, v in json.loads(resolved_path.read_text()).items()}
 
     rows = []
     with open(jsonl) as f:
@@ -61,26 +71,36 @@ def load_ffic_rows(ffic_dir: pathlib.Path) -> list[dict]:
             if not line:
                 continue
             case = json.loads(line)
+            case_date_ts = parse_timestamp(case.get("date", ""))
+
             for mkt in case.get("markets", []):
-                cid = (
-                    mkt.get("condition_id_full")
-                    or mkt.get("condition_id")
-                    or mkt.get("market_id", "")
-                )
-                news_ts = parse_timestamp(
-                    mkt.get("resolution_timestamp") or case.get("date", "")
-                )
+                prefix = mkt.get("market_id_prefix", "").lower()
+                if not prefix:
+                    continue
+
+                # Resolution timestamp: prefer market-level, fall back to case date
+                res_ts = parse_timestamp(mkt.get("resolution_date", "")) or case_date_ts
+
+                # Full condition_id: use resolved if available, else use prefix
+                full_cid = resolved.get(prefix, prefix)
+
+                trade_avail = mkt.get("trade_history_available", False)
+                # treat True and "partial" as available
+                is_available = trade_avail is True or trade_avail == "partial"
+
                 rows.append(
                     {
-                        "condition_id": cid.lower(),
+                        "market_id_prefix": prefix,
+                        "condition_id": full_cid,
                         "is_leaked": 1,
                         "case_id": case.get("case_id", ""),
                         "case_title": case.get("title", ""),
                         "category": case.get("category", ""),
-                        "news_timestamp": news_ts,
-                        "window_start_24h": news_ts - 86_400,
-                        "window_start_48h": news_ts - 172_800,
+                        "news_timestamp": res_ts,
+                        "window_start_24h": res_ts - 86_400,
+                        "window_start_48h": res_ts - 172_800,
                         "resolution_outcome": mkt.get("resolution_outcome", ""),
+                        "trade_available": is_available,
                     }
                 )
     return rows
@@ -88,7 +108,7 @@ def load_ffic_rows(ffic_dir: pathlib.Path) -> list[dict]:
 
 def load_polymarket_market_metadata(poly_dir: pathlib.Path) -> pd.DataFrame:
     """
-    Load market metadata from the already-downloaded filtered parquet files.
+    Load market metadata from already-downloaded filtered parquet files.
     Returns one row per unique condition_id with category and resolved_at.
     """
     if not poly_dir.exists() or not any(poly_dir.glob("*.parquet")):
@@ -99,6 +119,7 @@ def load_polymarket_market_metadata(poly_dir: pathlib.Path) -> pd.DataFrame:
         )
         return pd.DataFrame(columns=["condition_id", "category", "resolved_at"])
 
+    import duckdb
     con = duckdb.connect()
     parquet_glob = str(poly_dir / "*.parquet")
     df = con.execute(
@@ -107,7 +128,8 @@ def load_polymarket_market_metadata(poly_dir: pathlib.Path) -> pd.DataFrame:
             lower(condition_id) AS condition_id,
             category,
             category_refined,
-            ANY_VALUE(resolved_at) AS resolved_at
+            ANY_VALUE(resolved_at)    AS resolved_at,
+            ANY_VALUE(market_slug)    AS market_slug
         FROM read_parquet('{parquet_glob}')
         GROUP BY 1, 2, 3
         """
@@ -119,14 +141,14 @@ def load_polymarket_market_metadata(poly_dir: pathlib.Path) -> pd.DataFrame:
 def select_controls(
     leaked_rows: list[dict],
     all_markets: pd.DataFrame,
-    leaked_ids: set[str],
+    leaked_prefixes: set[str],
     n_controls: int,
 ) -> list[dict]:
     """
     Select matched control markets:
       - Same category as a leaked market
       - resolved_at within ±30 days of the corresponding leaked market
-      - Not in FFIC leaked set
+      - Not in FFIC leaked set (checked by prefix and full condition_id)
     """
     if all_markets.empty:
         print("[warn] No Polymarket market metadata available — skipping control selection.")
@@ -137,29 +159,38 @@ def select_controls(
         cat = row["category"]
         leaked_by_cat.setdefault(cat, []).append(row["news_timestamp"])
 
+    leaked_full_ids = {r["condition_id"] for r in leaked_rows}
+
     controls: list[dict] = []
     seen: set[str] = set()
     WINDOW_SEC = 30 * 86_400  # ±30 days
 
     for _, mkt_row in all_markets.iterrows():
         cid = str(mkt_row["condition_id"]).lower()
-        if cid in leaked_ids or cid in seen:
+
+        # Skip if it looks like a leaked market
+        is_leaked = (
+            cid in leaked_full_ids
+            or any(cid.startswith(pfx) for pfx in leaked_prefixes)
+        )
+        if is_leaked or cid in seen:
             continue
+
         cat = str(mkt_row.get("category", ""))
         if cat not in leaked_by_cat:
             continue
 
         res_at = mkt_row.get("resolved_at")
-        if pd.isna(res_at) or res_at == 0:
+        if pd.isna(res_at) or not res_at:
             continue
-        res_ts = int(res_at) if isinstance(res_at, (int, float)) else parse_timestamp(str(res_at))
+        res_ts = int(float(res_at)) if isinstance(res_at, (int, float, str)) else 0
 
-        # Check if close to any leaked market in same category
         for leaked_ts in leaked_by_cat[cat]:
             if abs(res_ts - leaked_ts) <= WINDOW_SEC:
                 seen.add(cid)
                 controls.append(
                     {
+                        "market_id_prefix": cid[:10],
                         "condition_id": cid,
                         "is_leaked": 0,
                         "case_id": "",
@@ -169,6 +200,7 @@ def select_controls(
                         "window_start_24h": res_ts - 86_400,
                         "window_start_48h": res_ts - 172_800,
                         "resolution_outcome": "",
+                        "trade_available": True,
                     }
                 )
                 break
@@ -184,22 +216,26 @@ def main() -> None:
 
     print("Loading FFIC rows ...")
     leaked_rows = load_ffic_rows(FFIC_DIR)
-    leaked_ids = {r["condition_id"] for r in leaked_rows}
-    print(f"  {len(leaked_rows)} leaked market rows ({len(leaked_ids)} unique condition_ids)")
+    leaked_prefixes = {r["market_id_prefix"] for r in leaked_rows}
+    print(f"  {len(leaked_rows)} leaked market rows ({len(leaked_prefixes)} unique prefixes)")
+
+    # Filter to only markets with retrievable trade history
+    available_rows = [r for r in leaked_rows if r["trade_available"]]
+    print(f"  {len(available_rows)} with retrievable trade history")
 
     print("Loading Polymarket market metadata ...")
     all_markets = load_polymarket_market_metadata(POLY_DIR)
     print(f"  {len(all_markets)} markets found in downloaded data")
 
-    target_controls = len(leaked_rows) * CONTROL_MULTIPLIER
+    target_controls = len(available_rows) * CONTROL_MULTIPLIER
     print(f"Selecting up to {target_controls} matched control markets ...")
-    control_rows = select_controls(leaked_rows, all_markets, leaked_ids, target_controls)
+    control_rows = select_controls(available_rows, all_markets, leaked_prefixes, target_controls)
     print(f"  {len(control_rows)} control markets selected")
 
+    # Use all leaked rows (not just trade-available) for the index — filters happen in profile_builder
     all_rows = leaked_rows + control_rows
     df = pd.DataFrame(all_rows)
-    # Deduplicate (same condition_id could appear in multiple FFIC cases)
-    df = df.drop_duplicates(subset=["condition_id", "is_leaked"])
+    df = df.drop_duplicates(subset=["market_id_prefix", "is_leaked"])
 
     out = PROCESSED_DIR / "market_index.parquet"
     df.to_parquet(out, index=False)
