@@ -61,28 +61,55 @@ def filter_trades(market_index: pd.DataFrame, window_col: str) -> pd.DataFrame:
     con = duckdb.connect()
     con.register("market_index", market_index)
 
-    # Build join condition using prefix matching
-    # DuckDB supports startswith(str, prefix) or LIKE 'prefix%'
-    # We join on condition_id prefix-matching market_id_prefix
-    query = f"""
-    SELECT
-        t.*,
-        m.is_leaked,
-        m.case_id,
-        m.case_title,
-        m.news_timestamp,
-        m.market_id_prefix,
-        m.{window_col} AS window_start
-    FROM read_parquet('{parquet_glob}') AS t
-    INNER JOIN market_index AS m
-        ON lower(t.condition_id) LIKE m.market_id_prefix || '%'
-    WHERE
-        t.block_timestamp >= m.{window_col}
-        AND t.block_timestamp < m.news_timestamp
-    """
-    print(f"  Filtering trades (window: {window_col}) ...")
-    df = con.execute(query).df()
+    print(f"  Filtering trades across {len(list(POLY_DIR.glob('*.parquet')))} files (window: {window_col}) ...")
+    rows = []
+    for p in POLY_DIR.glob("*.parquet"):
+        query = f"""
+        SELECT
+            t.* EXCLUDE (resolved_at, category),
+            m.is_leaked,
+            m.case_id,
+            m.case_title,
+            m.news_timestamp,
+            m.market_id_prefix,
+            m.{window_col} AS window_start
+        FROM read_parquet('{str(p)}') AS t
+        INNER JOIN market_index AS m
+            ON lower(t.condition_id) LIKE m.market_id_prefix || '%'
+        WHERE
+            t.block_timestamp >= m.{window_col}
+            AND t.block_timestamp < m.news_timestamp
+        """
+        try:
+            df_p = con.execute(query).df()
+            if len(df_p) > 0:
+                rows.append(df_p)
+        except Exception as e:
+            # If EXCLUDE fails because columns don't exist, try without EXCLUDE
+            try:
+                query_fallback = f"""
+                SELECT
+                    t.*,
+                    m.is_leaked,
+                    m.case_id,
+                    m.case_title,
+                    m.news_timestamp,
+                    m.market_id_prefix,
+                    m.{window_col} AS window_start
+                FROM read_parquet('{str(p)}') AS t
+                INNER JOIN market_index AS m
+                    ON lower(t.condition_id) LIKE m.market_id_prefix || '%'
+                WHERE
+                    t.block_timestamp >= m.{window_col}
+                    AND t.block_timestamp < m.news_timestamp
+                """
+                df_p = con.execute(query_fallback).df()
+                if len(df_p) > 0:
+                    rows.append(df_p)
+            except Exception:
+                continue
     con.close()
+    df = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
     print(f"  {len(df):,} trades in pre-news windows")
     return df
 

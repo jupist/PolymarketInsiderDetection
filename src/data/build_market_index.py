@@ -36,11 +36,18 @@ CONTROL_MULTIPLIER = 3   # aim for 3× as many control markets as leaked
 
 
 def parse_timestamp(ts_str: str) -> int:
-    """Parse ISO 8601 date/datetime string to Unix seconds."""
-    if not ts_str:
+    """Parse ISO 8601 date/datetime string or integer string to Unix seconds."""
+    if not ts_str or pd.isna(ts_str):
         return 0
     ts_str = str(ts_str).strip().rstrip("Z")
-    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+    if ts_str.isdigit():
+        return int(ts_str)
+    try:
+        if float(ts_str) > 1e8:
+            return int(float(ts_str))
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d", "%Y-%m-%d %H:%M:%S"):
         try:
             dt = datetime.strptime(ts_str, fmt).replace(tzinfo=timezone.utc)
             return int(dt.timestamp())
@@ -121,21 +128,29 @@ def load_polymarket_market_metadata(poly_dir: pathlib.Path) -> pd.DataFrame:
 
     import duckdb
     con = duckdb.connect()
-    parquet_glob = str(poly_dir / "*.parquet")
-    df = con.execute(
-        f"""
-        SELECT
-            lower(condition_id) AS condition_id,
-            category,
-            category_refined,
-            ANY_VALUE(resolved_at)    AS resolved_at,
-            ANY_VALUE(market_slug)    AS market_slug
-        FROM read_parquet('{parquet_glob}')
-        GROUP BY 1, 2, 3
-        """
-    ).df()
+    rows = []
+    for p in poly_dir.glob("*.parquet"):
+        try:
+            df_p = con.execute(
+                f"""
+                SELECT
+                    lower(condition_id) AS condition_id,
+                    ANY_VALUE(category) AS category,
+                    ANY_VALUE(category_refined) AS category_refined,
+                    ANY_VALUE(try_cast(resolved_at AS VARCHAR)) AS resolved_at,
+                    ANY_VALUE(market_slug) AS market_slug
+                FROM read_parquet('{str(p)}')
+                GROUP BY 1
+                """
+            ).df()
+            rows.append(df_p)
+        except Exception as e:
+            continue
     con.close()
-    return df
+    if not rows:
+        return pd.DataFrame(columns=["condition_id", "category", "resolved_at"])
+    df = pd.concat(rows, ignore_index=True)
+    return df.drop_duplicates(subset=["condition_id"])
 
 
 def select_controls(
