@@ -21,42 +21,9 @@ graph TD
     H --> I
 ```
 
-### ASCII Pipeline Overview
-```text
-[Raw On-Chain Trades (1.2B rows)]  +  [FFIC Case Inventory (Ground Truth)]
-               \                                    /
-                v                                  v
-       +----------------------------------------------------+
-       |  Data Acquisition & Pre-News Window Filtering      |
-       |  (DuckDB out-of-core SQL over Apache Parquet)      |
-       +----------------------------------------------------+
-                                 |
-                                 v
-       +----------------------------------------------------+
-       |  Behavioral Feature Engineering (Profile Builder)  |
-       |  (13-Dim Vectors: Sizing, HHI Concentration, Bias) |
-       +----------------------------------------------------+
-                                 |
-           +---------------------+---------------------+
-           |                                           |
-           v                                           v
-+-----------------------+                   +-----------------------+
-|   Isolation Forest    |                   |  PyTorch Autoencoder  |
-|  (Path-Length Score)  |                   | (Reconstruction Error)|
-+-----------------------+                   +-----------------------+
-           \                                           /
-            v                                         v
-       +----------------------------------------------------+
-       |  Evaluation Metrics & CTF Resolution Validation    |
-       |  (Precision@K, ROC-AUC, PR-AUC, LOCO Generalization)|
-       +----------------------------------------------------+
-```
-
 ---
 
 ## Quickstart & Executable Pipeline
-
-We prioritize a clean, executable command-line interface over interactive notebooks for production reliability and automated surveillance runs. 
 
 ### 1. Environment Setup
 ```bash
@@ -82,7 +49,7 @@ python run_pipeline.py
 
 ## Experimental Results & Evaluation
 
-Our models are trained exclusively on 1,598 control-market traders as a baseline of normal trading behavior. They are never shown an insider label during training. During testing, they score all 13,788 unique trader wallets across both control and leaked markets.
+The anomaly detection models are trained exclusively on 1,598 control-market traders as a baseline of normal trading behavior. No insider labels are provided during training. During testing, the models score all 13,788 unique trader wallets across both control and leaked markets.
 
 | Model Architecture | Precision@10 | Precision@20 | Precision@100 | ROC-AUC | PR-AUC | Recall@1%FPR |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -93,7 +60,7 @@ Our models are trained exclusively on 1,598 control-market traders as a baseline
 ### Methodology & The Retail Noise Nuance
 Why is Precision@100 between 99% and 100%, while ROC-AUC is approximately 0.69?
 1. **Market-Level vs. Wallet-Level Ground Truth:** The academic FFIC dataset documents which markets experienced news leaks (`is_leaked_market = 1`), rather than listing individual insider wallet addresses. When evaluating global ROC-AUC, every single trader in a leaked market is treated as a positive target.
-2. **The Retail Noise Effect:** A leaked market (such as a U.S. Presidential Election contract or Bitcoin ETF approval) contains thousands of ordinary retail participants betting normally. Our anomaly models correctly assign low anomaly scores to these normal retail traders. In a global ROC-AUC calculation against market-level labels, these correct low scores are penalized as False Negatives, depressing global AUC.
+2. **The Retail Noise Effect:** A leaked market (such as a U.S. Presidential Election contract or Bitcoin ETF approval) contains thousands of ordinary retail participants betting normally. The anomaly models correctly assign low anomaly scores to these normal retail traders. In a global ROC-AUC calculation against market-level labels, these correct low scores are penalized as False Negatives, depressing global AUC.
 3. **Out-of-Distribution Localization:** Achieving 100% Precision@100 proves that the extreme right tail of structural anomalies across the entire platform belongs exclusively to actors in leaked markets. The models successfully ignored thousands of normal retail bettors and isolated the exact wallets exhibiting abnormal pre-news portfolio concentration ($HHI \approx 1.0$), maximum-limit bet sizes, and acute timing precision.
 
 ---
@@ -110,7 +77,7 @@ To process over 1.2 billion on-chain trade records without memory exhaustion or 
 
 ## Model Selection: Why Isolation Forest?
 
-We compared deep neural autoencoders and tree-based Isolation Forests to establish a robust compliance surveillance system. We compared autoencoders and Isolation Forest. Isolation Forest was selected because it required no reconstruction training, scaled linearly to large datasets, and produced higher Precision@K. While the PyTorch Autoencoder achieved slightly higher recall at the 1% false positive threshold, the Isolation Forest's ensemble of random tree splits natively isolates heavy-tailed financial microstructure features (such as sudden volume spikes and extreme Herfindahl-Hirschman concentration ratios) in linear time, making it exceptionally well-suited for high-throughput, low-latency live exchange monitoring.
+Deep neural autoencoders and tree-based Isolation Forests were evaluated to establish a robust compliance surveillance system. Isolation Forest was selected because it required no reconstruction training, scaled linearly to large datasets, and produced higher Precision@K. While the PyTorch Autoencoder achieved slightly higher recall at the 1% false positive threshold, the Isolation Forest's ensemble of random tree splits natively isolates heavy-tailed financial microstructure features (such as sudden volume spikes and extreme Herfindahl-Hirschman concentration ratios) in linear time, making it exceptionally well-suited for high-throughput, low-latency live exchange monitoring.
 
 ---
 
