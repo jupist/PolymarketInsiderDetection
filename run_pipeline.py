@@ -55,13 +55,13 @@ def main() -> None:
     args = parser.parse_args()
 
     start_time = time.time()
-    print("\n🚀 Starting Polymarket Insider Detection Pipeline...")
+    print("\nStarting Polymarket Insider Detection Pipeline...")
 
     if args.eval_only:
         print_step(5, "Evaluation & Resolution Validation")
         metrics.load_and_evaluate()
         validate_resolutions.main()
-        print(f"\n✅ Pipeline completed in {time.time() - start_time:.2f}s")
+        print(f"\nPipeline completed in {time.time() - start_time:.2f}s")
         return
 
     # Step 1: Data Acquisition
@@ -74,7 +74,7 @@ def main() -> None:
         print("\nFetching matched control market trade candidates...")
         fetch_control_markets.main()
     else:
-        print("✔ Raw datasets already exist. Skipping download (use --force-data to re-fetch).")
+        print("[skip] Raw datasets already exist. Skipping download (use --force-data to re-fetch).")
 
     # Step 2: Market Index
     print_step(2, "Master Market Indexing & Pre-News Window Definition")
@@ -86,9 +86,9 @@ def main() -> None:
 
     # Step 4: Model Training & Scoring
     print_step(4, "Anomaly Detection Modeling (IF & Autoencoder)")
-    print("--> Running Isolation Forest baseline model...")
+    print("Running Isolation Forest baseline model...")
     isolation_forest.run()
-    print("\n--> Running PyTorch Autoencoder baseline model...")
+    print("\nRunning PyTorch Autoencoder baseline model...")
     autoencoder.run()
 
     # Step 5: Evaluation
@@ -97,7 +97,7 @@ def main() -> None:
     validate_resolutions.main()
 
     elapsed = time.time() - start_time
-    print(f"\n🎉 End-to-end pipeline completed successfully in {elapsed:.2f} seconds!")
+    print(f"\nEnd-to-end pipeline completed successfully in {elapsed:.2f} seconds.")
 
 
 if __name__ == "__main__":
